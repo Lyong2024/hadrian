@@ -60,15 +60,16 @@ function IndexedDBSeeder({
 }
 
 // --- Image assets (stored in public/story-assets/studio/) ---
-// Generated via: http://localhost:5173/api/v1/images/generations (openai/gpt-image-1)
+// Generated via: http://localhost:5173/api/v1/images/generations (openai/gpt-image-1),
+// re-encoded as WebP q82 to keep the repo small
 
-const IMG_LIGHTHOUSE = "story-assets/studio/lighthouse.png";
+const IMG_LIGHTHOUSE = "story-assets/studio/lighthouse.webp";
 
-const IMG_CITY = "story-assets/studio/city.png";
+const IMG_CITY = "story-assets/studio/city.webp";
 
-const IMG_LIBRARY = "story-assets/studio/library.png";
+const IMG_LIBRARY = "story-assets/studio/library.webp";
 
-const IMG_ASTRONAUT = "story-assets/studio/astronaut.png";
+const IMG_ASTRONAUT = "story-assets/studio/astronaut.webp";
 
 // --- Revised prompts from DALL-E 3 ---
 
