@@ -127,12 +127,25 @@ pub struct CostInjectionParams<'a> {
     pub pricing: &'a crate::pricing::PricingConfig,
     pub db: Option<&'a std::sync::Arc<crate::db::DbPool>>,
     pub usage_entry: Option<crate::models::UsageLogEntry>,
+    /// Org scope for admin `model_pricing` overrides on the non-streaming
+    /// path. Handlers pass the request's resolved org so org-scoped admin
+    /// pricing applies even when no usage entry is supplied; falls back to
+    /// the usage entry's org attribution when `None`.
+    pub pricing_org_id: Option<uuid::Uuid>,
     #[cfg(feature = "server")]
     pub task_tracker: Option<&'a TaskTracker>,
     /// Handle to the usage-drain channel; used by `UsageTrackingStream` to
     /// log partial usage from `Drop` without spawning a task there directly.
     #[cfg(feature = "server")]
     pub usage_drain: Option<&'a crate::streaming::UsageDrainHandle>,
+    /// Budget/token reservation handoff from the API middleware. The
+    /// streaming branch claims it so settlement happens with actual usage
+    /// after the stream ends; non-streaming leaves it for the middleware.
+    #[cfg(feature = "server")]
+    pub settlement_cell: Option<crate::middleware::SettlementCell>,
+    /// Input-token estimate from the request payload, used when the provider
+    /// never reports usage on a stream (fallback previously logged input 0).
+    pub estimated_input_tokens: i64,
     pub max_response_body_bytes: usize,
     /// Idle timeout for streaming responses in seconds.
     /// If a streaming response doesn't receive a chunk within this timeout,
@@ -742,6 +755,8 @@ pub async fn inject_cost_into_response(params: CostInjectionParams<'_>) -> Respo
     let task_tracker = params.task_tracker;
     #[cfg(feature = "server")]
     let usage_drain = params.usage_drain;
+    #[cfg(feature = "server")]
+    let settlement_cell = params.settlement_cell.clone();
     let CostInjectionParams {
         response,
         provider,
@@ -749,10 +764,12 @@ pub async fn inject_cost_into_response(params: CostInjectionParams<'_>) -> Respo
         pricing,
         db,
         usage_entry,
+        pricing_org_id,
         max_response_body_bytes,
         streaming_idle_timeout_secs,
         validation_config,
         response_type,
+        estimated_input_tokens,
         ..
     } = params;
     // Only process successful JSON responses
@@ -793,6 +810,17 @@ pub async fn inject_cost_into_response(params: CostInjectionParams<'_>) -> Respo
                 (db, usage_entry, task_tracker, usage_drain)
             {
                 use futures_util::StreamExt;
+
+                // Claim the reservation handoff: settlement now happens in
+                // the streaming usage logger with actual usage instead of in
+                // the middleware (whose header-based settle would see no
+                // cost on an SSE response and refund the whole reservation).
+                let settlement = settlement_cell.and_then(|cell| cell.take());
+
+                let mut entry = entry;
+                // The stream is only wrapped on success responses; record the
+                // status the client actually received.
+                entry.status_code = Some(response.status().as_u16() as i16);
 
                 let (parts, body) = response.into_parts();
 
@@ -842,6 +870,8 @@ pub async fn inject_cost_into_response(params: CostInjectionParams<'_>) -> Respo
                     entry,
                     provider.to_string(),
                     model.to_string(),
+                    estimated_input_tokens,
+                    settlement,
                     tracker.clone(),
                     drain.clone(),
                 );
@@ -886,6 +916,12 @@ pub async fn inject_cost_into_response(params: CostInjectionParams<'_>) -> Respo
             return Response::from_parts(parts, Body::empty());
         }
     };
+
+    // Org scope for admin `model_pricing` overrides: the handler-supplied
+    // request org, falling back to the usage entry's attribution. When both
+    // are None only global admin rows apply, so one org's pricing rows never
+    // leak into another org's costs.
+    let pricing_org_id = pricing_org_id.or_else(|| usage_entry.as_ref().and_then(|e| e.org_id));
 
     // Try to parse as JSON and extract usage
     let extracted = match serde_json::from_slice::<serde_json::Value>(&bytes) {
@@ -987,19 +1023,43 @@ pub async fn inject_cost_into_response(params: CostInjectionParams<'_>) -> Respo
                         })
                 });
 
-            // Calculate cost in microcents
-            let cost_result = pricing.calculate_cost(provider, model, input, output);
-            let cost_microcents = cost_result.map(|(c, _)| c);
-            let pricing_source = cost_result
-                .map(|(_, s)| s)
-                .unwrap_or(crate::pricing::CostPricingSource::None);
+            // Provider-reported cost, in dollars (e.g. OpenRouter's `usage.cost`).
+            let provider_cost_dollars = usage.and_then(|u| u.get("cost")).and_then(|v| v.as_f64());
+
+            // Calculate catalog/config cost, then resolve against the
+            // provider-reported cost per the configured `cost_source` policy —
+            // the same resolution the streaming path applies.
+            let calculated = pricing.calculate_cost_detailed_scoped(
+                provider,
+                model,
+                &crate::pricing::TokenUsage {
+                    input_tokens: input,
+                    output_tokens: output,
+                    cached_tokens: Some(cached),
+                    reasoning_tokens: Some(reasoning),
+                    image_count: None,
+                    image_size: None,
+                    image_quality: None,
+                    audio_seconds: None,
+                    character_count: None,
+                    video_seconds: None,
+                },
+                pricing_org_id,
+            );
+            let (cost_microcents, pricing_source) =
+                pricing.resolve_cost(provider_cost_dollars, calculated);
 
             // Inject cost (in dollars) into the usage object in the response body.
-            // Only re-serialize when we actually mutate the JSON; otherwise we'd
-            // change the body length (whitespace, key order) and have to strip
-            // Content-Length unnecessarily.
+            // Only rewrite when the resolved cost did not come from the provider:
+            // a provider-reported cost is already in the body and is more precise
+            // than a round-trip through microcents. Only re-serialize when we
+            // actually mutate the JSON; otherwise we'd change the body length
+            // (whitespace, key order) and have to strip Content-Length
+            // unnecessarily.
             let mut body_modified = false;
-            if let Some(cost) = cost_microcents {
+            if let Some(cost) = cost_microcents
+                && pricing_source != crate::pricing::CostPricingSource::Provider
+            {
                 let cost_dollars = crate::pricing::microcents_to_dollars(cost);
                 if let Some(usage_obj) = json.get_mut("usage").and_then(|u| u.as_object_mut()) {
                     usage_obj.insert("cost".to_string(), serde_json::Value::from(cost_dollars));
@@ -1097,126 +1157,30 @@ pub async fn inject_cost_into_response(params: CostInjectionParams<'_>) -> Respo
     Response::from_parts(new_parts, Body::from(body_bytes))
 }
 
-/// Parameters for logging image/audio usage
-pub struct MediaUsageParams<'a> {
-    pub provider: &'a str,
-    pub model: &'a str,
-    pub pricing: &'a crate::pricing::PricingConfig,
-    pub db: Option<&'a std::sync::Arc<crate::db::DbPool>>,
-    pub api_key_id: Option<uuid::Uuid>,
-    #[cfg(feature = "server")]
-    pub task_tracker: &'a TaskTracker,
-    pub usage: crate::pricing::TokenUsage,
-}
-
-/// Log usage for image/audio endpoints and return cost info
+/// Compute the cost of a media request (images, TTS, transcription,
+/// translation, video) from per-unit pricing.
 ///
-/// This is used for endpoints that don't use the standard token-based usage tracking:
-/// - Image generation (per-image pricing)
-/// - Audio transcription/translation (per-second pricing)
-/// - Text-to-speech (per-character pricing)
+/// `org_id` scopes the lookup so org-scoped admin `model_pricing` rows
+/// apply to media spend too.
 ///
-/// Returns (cost_microcents, usage_logged) tuple
-pub async fn log_media_usage(params: MediaUsageParams<'_>) -> (Option<i64>, bool) {
-    #[cfg(feature = "server")]
-    let task_tracker = params.task_tracker;
-    let MediaUsageParams {
-        provider,
-        model,
-        pricing,
-        db,
-        api_key_id,
-        usage,
-        ..
-    } = params;
-
-    // Calculate cost
-    let cost_result = pricing.calculate_cost_detailed(provider, model, &usage);
+/// Media handlers surface the result as `X-Cost-Microcents` and
+/// `X-Pricing-Source` response headers; the API middleware reads those
+/// headers (alongside `X-Model`, `X-Image-Count`, etc.) and writes the
+/// single usage row for the request. Handlers must not write their own
+/// row: a handler-side write double-counts the spend.
+pub fn compute_media_cost(
+    provider: &str,
+    model: &str,
+    pricing: &crate::pricing::PricingConfig,
+    org_id: Option<uuid::Uuid>,
+    usage: &crate::pricing::TokenUsage,
+) -> (Option<i64>, crate::pricing::CostPricingSource) {
+    let cost_result = pricing.calculate_cost_detailed_scoped(provider, model, usage, org_id);
     let cost_microcents = cost_result.map(|(c, _)| c);
     let pricing_source = cost_result
         .map(|(_, s)| s)
         .unwrap_or(crate::pricing::CostPricingSource::None);
-
-    // Log usage to database if we have all required components
-    let usage_logged = if let (Some(db_pool), Some(key_id)) = (db, api_key_id) {
-        let entry = crate::models::UsageLogEntry {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            api_key_id: Some(key_id),
-            user_id: None,
-            org_id: None,
-            project_id: None,
-            team_id: None,
-            service_account_id: None,
-            model: model.to_string(),
-            provider: provider.to_string(),
-            input_tokens: 0,
-            output_tokens: 0,
-            cost_microcents,
-            http_referer: None,
-            request_at: chrono::Utc::now(),
-            streamed: false,
-            cached_tokens: 0,
-            reasoning_tokens: 0,
-            finish_reason: Some("stop".to_string()),
-            latency_ms: None,
-            cancelled: false,
-            status_code: Some(200),
-            pricing_source,
-            image_count: usage.image_count.map(|v| v as i32),
-            audio_seconds: usage.audio_seconds.map(|v| v as i32),
-            character_count: usage.character_count.map(|v| v as i32),
-            provider_source: None,
-            record_type: "model".to_string(),
-            tool_name: None,
-            tool_query: None,
-            tool_url: None,
-            tool_bytes_fetched: None,
-            tool_results_count: None,
-            tool_runtime_seconds: None,
-            tool_exit_code: None,
-        };
-
-        let db = db_pool.clone();
-        #[cfg(feature = "server")]
-        task_tracker.spawn(async move {
-            for attempt in 0..3 {
-                match db.usage().log(entry.clone()).await {
-                    Ok(_) => {
-                        tracing::debug!(
-                            "Logged media usage: model={}, cost_microcents={:?}",
-                            entry.model,
-                            entry.cost_microcents
-                        );
-                        break;
-                    }
-                    Err(e) if attempt == 2 => {
-                        tracing::error!(
-                            "Failed to log media usage after 3 attempts: {}. Entry: {:?}",
-                            e,
-                            entry
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to log media usage (attempt {}): {}. Retrying...",
-                            attempt + 1,
-                            e
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            100 * 2_u64.pow(attempt),
-                        ))
-                        .await;
-                    }
-                }
-            }
-        });
-        true
-    } else {
-        tracing::debug!("Media usage not logged: missing db or api_key_id");
-        false
-    };
-
-    (cost_microcents, usage_logged)
+    (cost_microcents, pricing_source)
 }
 
 #[cfg(test)]

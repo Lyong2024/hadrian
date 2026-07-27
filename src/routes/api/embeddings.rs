@@ -292,10 +292,16 @@ pub async fn api_v1_embeddings(
             pricing: &state.pricing,
             db: state.db.as_ref(),
             usage_entry: None,
+            pricing_org_id: crate::models::RequestPrincipal::from_auth(auth.as_ref().map(|e| &e.0))
+                .or_defaults(state.default_identity())
+                .org_id,
             #[cfg(feature = "server")]
             task_tracker: Some(&state.task_tracker),
             #[cfg(feature = "server")]
             usage_drain: Some(&state.usage_drain),
+            #[cfg(feature = "server")]
+            settlement_cell: None, // Non-streaming: middleware settles from headers
+            estimated_input_tokens: 0,
             max_response_body_bytes: state.config.server.max_response_body_bytes,
             streaming_idle_timeout_secs: 0, // Embeddings don't stream
             validation_config: &state.config.observability.response_validation,
